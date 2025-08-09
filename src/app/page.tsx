@@ -5,9 +5,6 @@ import React, { useEffect, useMemo, useState } from "react";
 import { supabase } from "./lib/supabaseClient"; // ✅ Supabase 클라이언트
 
 /** ========== LocalStorage helpers (로컬 전용 상태에 사용) ========== */
-function safeParse<T>(v: string | null, fallback: T): T {
-  try { return v ? (JSON.parse(v) as T) : fallback; } catch { return fallback; }
-}
 function useLocalStorage<T>(key: string, initialValue: T): [T, React.Dispatch<React.SetStateAction<T>>, boolean] {
   const [value, setValue] = React.useState(initialValue);
   const [ready, setReady] = React.useState(false);
@@ -48,20 +45,25 @@ async function kvSave<T>(key: string, value: T): Promise<void> {
 }
 
 // 로컬 초기값 → Supabase에서 최초 로드 → 이후 변경 시마다 Supabase에 저장
+// ✅ Supabase 공유 상태 훅 (덮어쓰기 버그 수정 버전)
 function useShared<T>(key: string, initial: T): [T, React.Dispatch<React.SetStateAction<T>>, boolean] {
   const [value, setValue] = React.useState<T>(initial);
   const [ready, setReady] = React.useState(false);
 
+  // ☝️ "초기값"은 한 번만 고정해서 사용 (렌더마다 바뀌지 않게)
+  const initialRef = React.useRef(initial);
+
   React.useEffect(() => {
     let alive = true;
     (async () => {
-      const loaded = await kvLoad<T>(key, initial);
+      // ⬇️ 여기도 initial 대신 '고정된' initialRef 사용
+      const loaded = await kvLoad<T>(key, initialRef.current);
       if (!alive) return;
       setValue(loaded);
       setReady(true);
     })();
     return () => { alive = false; };
-  }, [key]);
+  }, [key]); // ⬅️ ✅ 여기서 'initial' 제거!
 
   React.useEffect(() => {
     if (!ready) return;
@@ -271,61 +273,66 @@ export default function Home() {
   const [leaderId, setLeaderId] = useState<number | null>(null);
 
   // Supabase 준비되기 전엔 잠깐 로딩
-  if (!usersReady || !eventsReady) {
-    return (
-      <div style={{minHeight:"100dvh", display:"grid", placeItems:"center"}}>
-        <div style={{fontSize:14, color:"#6b7280"}}>데이터 불러오는 중…</div>
-      </div>
-    );
-  }
 
-  /** 지난 일정 자동 삭제 */
-  useEffect(()=>{
-    const t = todayStr();
-    setEvents(prev => prev.filter(e => cmpDate(e.date, t) >= 0));
-  },[]); // 최초 한번
 
-  /** 반복 일정 자동 생성(다음 일정 7일 전 1개 생성, 앱 열릴 때 체크) */
-  useEffect(()=>{
-    setEvents(prev=>{
-      const list = [...prev];
-      let changed = false;
-      const groups: Record<string, EventItem[]> = {};
-      const keyOf = (e: EventItem)=>`${e.title}|${e.time}|${e.category}`;
-      for(const ev of list){ (groups[keyOf(ev)] ||= []).push(ev); }
-      Object.values(groups).forEach(g=>{
-        const anyRepeat = g.some(x=>x.repeatWeekly);
-        if(!anyRepeat) return;
-        g.sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
-        const last = g[g.length-1];
-        const nextDate = addDays(last.date, 7);
-        const exists = g.some(x=>x.date===nextDate);
-        const shouldGenFrom = addDays(nextDate, -7);
-        if (!exists && todayStr() >= shouldGenFrom) {
-          list.push({
-            ...last,
-            id: Math.max(0, ...list.map(x=>x.id))+1,
-            date: nextDate,
-            repeatWeekly: true,
-            cancelRequests: [],
-            notifiedToAll: false,
-            openForApplications: last.participants.length < CAPACITY,
-          });
-          changed = true;
-        }
-      });
-      return changed ? list : prev;
+/** 지난 일정 자동 삭제 */
+useEffect(() => {
+  if (!eventsReady) return;
+  const t = todayStr();
+  setEvents(prev => prev.filter(e => cmpDate(e.date, t) >= 0));
+}, [eventsReady, setEvents]);  // ✅ 딱 여기서 깔끔히 끝.
+
+/** 반복 일정 자동 생성(다음 일정 7일 전 1개 생성) */
+useEffect(() => {
+  if (!eventsReady) return;
+
+  setEvents(prev => {
+    const list = [...prev];
+    let changed = false;
+
+    const groups: Record<string, EventItem[]> = {};
+    const keyOf = (e: EventItem) => `${e.title}|${e.time}|${e.category}`;
+    for (const ev of list) (groups[keyOf(ev)] ||= []).push(ev);
+
+    Object.values(groups).forEach(g => {
+      if (!g.some(x => x.repeatWeekly)) return;
+      g.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+      const last = g[g.length - 1];
+
+      const nextDate = addDays(last.date, 7);
+      const exists = g.some(x => x.date === nextDate);
+      const shouldGenFrom = addDays(nextDate, -7);
+
+      if (!exists && todayStr() >= shouldGenFrom) {
+        list.push({
+          ...last,
+          id: Math.max(0, ...list.map(x => x.id)) + 1,
+          date: nextDate,
+          repeatWeekly: true,
+          cancelRequests: [],
+          notifiedToAll: false,
+          openForApplications: last.participants.length < CAPACITY,
+        });
+        changed = true;
+      }
     });
-  },[events.length, setEvents]);
+
+    return changed ? list : prev;
+  });
+}, [eventsReady, setEvents, events.length]); // ✅ 여기도 여기서 끝.
+
 
   /** 파생값 */
-  const feedByCategory = useMemo(()=>{
-    const map: Record<string, EventItem[]> = {};
-    for(const c of CATEGORIES) map[c] = [];
-    for(const e of events) (map[e.category] ||= []).push(e);
-    for(const c of Object.keys(map)) map[c].sort((a,b)=> (a.date+a.time).localeCompare(b.date+b.time));
-    return map;
-  },[events]);
+const feedByCategory = useMemo(() => {
+  if (!eventsReady) return {} as Record<string, EventItem[]>;
+  const map: Record<string, EventItem[]> = {};
+  for (const c of CATEGORIES) map[c] = [];
+  for (const e of events) (map[e.category] ||= []).push(e);
+  for (const c of Object.keys(map)) {
+    map[c].sort((a,b)=> (a.date+a.time).localeCompare(b.date+b.time));
+  }
+  return map;
+}, [events, eventsReady]);
 
   /** 인증 */
   function logIn() {
@@ -459,14 +466,35 @@ export default function Home() {
   }
 
   /** 관리자: 가입자 생성 */
-  function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
-    if (!isAdmin) return;
-    if (!name || !pw) { alert("이름/비밀번호를 입력해주세요."); return; }
-    if (users.some(u=>u.name===name)) { alert("이미 존재하는 이름입니다."); return; }
-    const nu: User = { id: Math.max(...users.map(u=>u.id), 0)+1, name, password: pw, isAdmin: makeAdmin };
-    setUsers(prev=>[...prev, nu]);
-    alert("가입자를 추가했습니다.");
+function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
+  if (!isAdmin) return;
+
+  // ✅ 동기화 중일 때 막기
+  if (!usersReady) {
+    alert("데이터 동기화 중입니다. 1~2초 후 다시 시도해주세요.");
+    return;
   }
+
+  if (!name || !pw) {
+    alert("이름/비밀번호를 입력해주세요.");
+    return;
+  }
+
+  if (users.some(u => u.name === name)) {
+    alert("이미 존재하는 이름입니다.");
+    return;
+  }
+
+  const nu: User = {
+    id: Math.max(...users.map(u => u.id), 0) + 1,
+    name,
+    password: pw,
+    isAdmin: makeAdmin,
+  };
+
+  setUsers(prev => [...prev, nu]);
+  alert("가입자를 추가했습니다.");
+}
 
   /** 로그인 게이트 */
   if (!currentUser) {
@@ -754,7 +782,7 @@ export default function Home() {
             {/* 가입자 관리 */}
             <Card>
               <div style={{fontSize:14, fontWeight:600, marginBottom:8}}>가입자 관리</div>
-              <AdminUserCreator onCreate={adminCreateUser} />
+              <AdminUserCreator onCreate={adminCreateUser} disabled={!usersReady} />
               <div style={{marginTop:12, display:"grid", gridTemplateColumns:"1fr 1fr", gap:8}}>
                 {users.map(u=>(
                   <div key={u.id} style={{border:"1px solid #e5e7eb", borderRadius:10, padding:8, display:"flex", justifyContent:"space-between", fontSize:14}}>
@@ -790,23 +818,72 @@ export default function Home() {
 }
 
 /** ========== 하위: 관리자 가입자 추가 ========== */
-function AdminUserCreator({ onCreate }: { onCreate: (name:string, pw:string, isAdmin:boolean)=>void }) {
-  const [name, setName] = useState(""); const [pw, setPw] = useState(""); const [admin, setAdmin] = useState(false);
+function AdminUserCreator({
+  onCreate,
+  disabled = false, // ✅ 비활성화 prop 추가
+}: {
+  onCreate: (name: string, pw: string, isAdmin: boolean) => void;
+  disabled?: boolean;
+}) {
+  const [name, setName] = useState("");
+  const [pw, setPw] = useState("");
+  const [admin, setAdmin] = useState(false);
+
   return (
-    <div style={{display:"grid", gridTemplateColumns:"1.5fr 1.5fr 1fr 1fr", gap:8, alignItems:"end"}}>
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "1.5fr 1.5fr 1fr 1fr",
+        gap: 8,
+        alignItems: "end",
+        opacity: disabled ? 0.6 : 1, // ✅ 동기화 중 흐리게
+      }}
+    >
       <div>
         <label style={S.label}>이름</label>
-        <Input value={name} onChange={e=>setName(e.target.value)} placeholder="예: 홍길동" />
+        <Input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="예: 홍길동"
+          disabled={disabled} // ✅ 입력 비활성화
+        />
       </div>
       <div>
         <label style={S.label}>비밀번호</label>
-        <Input type="password" value={pw} onChange={e=>setPw(e.target.value)} placeholder="******" />
+        <Input
+          type="password"
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          placeholder="******"
+          disabled={disabled}
+        />
       </div>
-      <label style={{display:"flex", alignItems:"center", gap:8}}>
-        <input type="checkbox" checked={admin} onChange={e=>setAdmin(e.target.checked)} />
+      <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={admin}
+          onChange={(e) => setAdmin(e.target.checked)}
+          disabled={disabled}
+        />
         <span>관리자</span>
       </label>
-      <Button onClick={()=>{ onCreate(name, pw, admin); setName(""); setPw(""); setAdmin(false); }}>가입자 추가</Button>
+      <Button
+        onClick={() => {
+          onCreate(name, pw, admin);
+          setName("");
+          setPw("");
+          setAdmin(false);
+        }}
+        disabled={disabled} // ✅ 버튼 비활성화
+      >
+        가입자 추가
+      </Button>
+
+      {disabled && (
+        <div style={{ gridColumn: "1 / -1", fontSize: 12, color: "#6b7280" }}>
+          🔄 Supabase와 동기화 중입니다. 잠시만 기다려 주세요…
+        </div>
+      )}
     </div>
   );
 }
