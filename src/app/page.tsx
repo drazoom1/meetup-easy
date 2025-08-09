@@ -121,32 +121,32 @@ btn: {
   display: "inline-flex", alignItems: "center", justifyContent: "center",
   whiteSpace: "nowrap", wordBreak: "keep-all", flexShrink: 0
 },
-  btnGray: {
-    height: 44, padding: "0 16px",
-    background: "#f1f3f4", color: "#1f1f1f",
-    borderRadius: 8, border: "1px solid #e6e9ef",
-    cursor: "pointer" as const,
-    transition: "box-shadow .15s ease, transform .02s ease, background .15s ease"
+btnGray: {
+  height: 44, padding: "0 16px",
+  background: "#f1f3f4", color: "#1f1f1f",
+  borderRadius: 8, border: "1px solid #e6e9ef",
+  cursor: "pointer" as const,
+  transition: "box-shadow .15s ease, transform .02s ease, background .15s ease",
   display: "inline-flex",
-alignItems: "center",
-justifyContent: "center",
-whiteSpace: "nowrap",
-wordBreak: "keep-all",
-flexShrink: 0
-  },
-  btnRed: {
-    height: 44, padding: "0 16px",
-    background: "#d93025", color: "#fff",
-    borderRadius: 8, border: "1px solid #d93025",
-    cursor: "pointer" as const,
-    transition: "box-shadow .15s ease, transform .02s ease, background .15s ease"
+  alignItems: "center",
+  justifyContent: "center",
+  whiteSpace: "nowrap",
+  wordBreak: "keep-all",
+  flexShrink: 0,
+},
+btnRed: {
+  height: 44, padding: "0 16px",
+  background: "#d93025", color: "#fff",
+  borderRadius: 8, border: "1px solid #d93025",
+  cursor: "pointer" as const,
+  transition: "box-shadow .15s ease, transform .02s ease, background .15s ease",
   display: "inline-flex",
-alignItems: "center",
-justifyContent: "center",
-whiteSpace: "nowrap",
-wordBreak: "keep-all",
-flexShrink: 0
-  },
+  alignItems: "center",
+  justifyContent: "center",
+  whiteSpace: "nowrap",
+  wordBreak: "keep-all",
+  flexShrink: 0,
+},
   input: {
     height: 40, padding: "0 12px",
     border: "1px solid #e6e9ef", borderRadius: 8, width: "100%",
@@ -214,6 +214,9 @@ export default function Home() {
   const [events, setEvents] = useLocalStorage<EventItem[]>("meet_events_v2", []);
   const [tab, setTab] = useLocalStorage<"feed"|"calendar"|"create"|"admin">("meet_tab_v2", "feed");
   const [openCat, setOpenCat] = useLocalStorage<string | null>("meet_feed_cat_open_v2", null);
+
+  // ⬇ 이 한 줄 추가
+  const isMobile = useIsMobile();
 
   const currentUser = users.find(u=>u.id===currentUserId) ?? null;
   const isAdmin = !!currentUser?.isAdmin;
