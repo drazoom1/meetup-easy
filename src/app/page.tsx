@@ -110,20 +110,29 @@ const S = {
     boxShadow: "0 1px 2px rgba(0,0,0,.06)",
     transition: "box-shadow .18s ease, transform .18s ease"
   },
-  btn: {
-    height: 44, padding: "0 16px",
-    background: "#1a73e8", color: "#fff",
-    borderRadius: 8, border: "1px solid #1a73e8",
-    cursor: "pointer" as const,
-    boxShadow: "0 1px 2px rgba(0,0,0,.10)",
-    transition: "box-shadow .15s ease, transform .02s ease, background .15s ease"
-  },
+btn: {
+  height: 44, padding: "0 16px",
+  background: "#1a73e8", color: "#fff",
+  borderRadius: 8, border: "1px solid #1a73e8",
+  cursor: "pointer" as const,
+  boxShadow: "0 1px 2px rgba(0,0,0,.10)",
+  transition: "box-shadow .15s ease, transform .02s ease, background .15s ease",
+  /* ⬇ 추가 */
+  display: "inline-flex", alignItems: "center", justifyContent: "center",
+  whiteSpace: "nowrap", wordBreak: "keep-all", flexShrink: 0
+},
   btnGray: {
     height: 44, padding: "0 16px",
     background: "#f1f3f4", color: "#1f1f1f",
     borderRadius: 8, border: "1px solid #e6e9ef",
     cursor: "pointer" as const,
     transition: "box-shadow .15s ease, transform .02s ease, background .15s ease"
+  display: "inline-flex",
+alignItems: "center",
+justifyContent: "center",
+whiteSpace: "nowrap",
+wordBreak: "keep-all",
+flexShrink: 0
   },
   btnRed: {
     height: 44, padding: "0 16px",
@@ -131,6 +140,12 @@ const S = {
     borderRadius: 8, border: "1px solid #d93025",
     cursor: "pointer" as const,
     transition: "box-shadow .15s ease, transform .02s ease, background .15s ease"
+  display: "inline-flex",
+alignItems: "center",
+justifyContent: "center",
+whiteSpace: "nowrap",
+wordBreak: "keep-all",
+flexShrink: 0
   },
   input: {
     height: 40, padding: "0 12px",
@@ -139,7 +154,7 @@ const S = {
     transition: "border-color .15s ease, box-shadow .15s ease"
   },
   label: { fontSize: 12, color: "#5f6368", display: "block", marginBottom: 6 },
-  small: { fontSize: 12, color: "#5f6368" },
+small: { fontSize: 12, color: "#5f6368", wordBreak: "keep-all" },
 };
 
 
@@ -437,11 +452,33 @@ export default function Home() {
   return (
     <div style={{minHeight:"100dvh", background:"linear-gradient(#fff, #f8fafc)"}}>
       <header style={{position:"sticky", top:0, zIndex:10, background:"#ffffffcc", backdropFilter:"blur(8px)", borderBottom:"1px solid #e5e7eb"}}>
-        <div style={{...S.container, display:"flex", justifyContent:"space-between", alignItems:"center", paddingTop:12, paddingBottom:12}}>
+<div style={{
+  ...S.container,
+  display:"flex",
+  justifyContent: isMobile ? "initial" : "space-between",
+  alignItems: isMobile ? "stretch" : "center",
+  flexDirection: isMobile ? "column" : "row",
+  gap: isMobile ? 8 : 0,
+  paddingTop:12, paddingBottom:12
+}}>
           <div style={{fontWeight:700}}>방학서부 전시대모임</div>
-          <div style={{display:"flex", alignItems:"center", gap:12, color:"#4b5563", fontSize:14}}>
+<div style={{
+  display:"flex",
+  alignItems:"center",
+  gap:12,
+  color:"#4b5563",
+  fontSize:14,
+  /* ⬇ 모바일에서 한 줄 유지 + 가로 스크롤 */
+  flexWrap: isMobile ? "nowrap" : "wrap",
+  overflowX: isMobile ? "auto" : "visible",
+  whiteSpace: "nowrap",
+  WebkitOverflowScrolling: "touch",
+  paddingBottom: isMobile ? 4 : 0
+}}>
 
-            <span>현재 사용자: <b>{currentUser.name}</b>{isAdmin?" (관리자)":""}</span>
+<span style={{whiteSpace:"nowrap", wordBreak:"keep-all", flex:"0 0 auto"}}>
+  현재 사용자: <b>{currentUser.name}</b>{isAdmin?" (관리자)":""}
+</span>
             <Button kind="gray" onClick={()=>setTab("feed")}>전시대일정</Button>
             <Button kind="gray" onClick={()=>setTab("calendar")}>캘린더</Button>
             {isAdmin && <Button kind="gray" onClick={()=>setTab("create")}>일정 만들기</Button>}
@@ -527,14 +564,17 @@ export default function Home() {
                           </div>
 
                             <div style={{
-                              display:"flex",
-                              flexDirection: isMobile ? "row" : "column",
-                              gap:8,
-                              minWidth: isMobile ? 0 : 180,
-                              width: isMobile ? "100%" : undefined,
-                              marginTop: isMobile ? 8 : 0,
-                              flexWrap: isMobile ? "wrap" : undefined
-                            }}>
+  display:"flex",
+  flexDirection: isMobile ? "row" : "column",
+  gap:8,
+  minWidth: isMobile ? 0 : 180,
+  width: isMobile ? "100%" : undefined,
+  marginTop: isMobile ? 8 : 0,
+  flexWrap: isMobile ? "nowrap" : undefined,
+  overflowX: isMobile ? "auto" : undefined,
+  whiteSpace: isMobile ? "nowrap" : undefined,
+  WebkitOverflowScrolling: isMobile ? "touch" : undefined
+}}>
                             {/* 참여/취소/지원 */}
                             {!isIn(ev, currentUser.id) && hasCapacity(ev) && (
                               <Button onClick={()=>joinEvent(ev.id)}>지원</Button>
