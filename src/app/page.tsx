@@ -2,7 +2,74 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import { supabase } from "./../lib/supabaseClient";
+import { supabase } from "@/lib/supabaseClient"; // ✅ Supabase 클라이언트
+
+/** ========== LocalStorage helpers (로컬 전용 상태에 사용) ========== */
+function safeParse<T>(v: string | null, fallback: T): T {
+  try { return v ? (JSON.parse(v) as T) : fallback; } catch { return fallback; }
+}
+function useLocalStorage<T>(key: string, initialValue: T): [T, React.Dispatch<React.SetStateAction<T>>, boolean] {
+  const [value, setValue] = React.useState(initialValue);
+  const [ready, setReady] = React.useState(false);
+  React.useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(key);
+      if (saved) setValue(JSON.parse(saved));
+    } catch {}
+    setReady(true);
+  }, [key]);
+  React.useEffect(() => {
+    if (!ready) return;
+    try { window.localStorage.setItem(key, JSON.stringify(value)); } catch {}
+  }, [key, value, ready]);
+  return [value, setValue, ready];
+}
+
+/** ========== Supabase KV helpers (공유 데이터: users / events) ========== */
+// key 하나에 JSON 통째로 저장/불러오기
+async function kvLoad<T>(key: string, fallback: T): Promise<T> {
+  const { data, error } = await supabase
+    .from("kv_store")
+    .select("value")
+    .eq("key", key)
+    .maybeSingle();
+  if (error) {
+    console.warn("kv load error", key, error);
+    return fallback;
+  }
+  return (data?.value as T) ?? fallback;
+}
+
+async function kvSave<T>(key: string, value: T): Promise<void> {
+  const { error } = await supabase
+    .from("kv_store")
+    .upsert({ key, value }, { onConflict: "key" });
+  if (error) console.warn("kv save error", key, error);
+}
+
+// 로컬 초기값 → Supabase에서 최초 로드 → 이후 변경 시마다 Supabase에 저장
+function useShared<T>(key: string, initial: T): [T, React.Dispatch<React.SetStateAction<T>>, boolean] {
+  const [value, setValue] = React.useState<T>(initial);
+  const [ready, setReady] = React.useState(false);
+
+  React.useEffect(() => {
+    let alive = true;
+    (async () => {
+      const loaded = await kvLoad<T>(key, initial);
+      if (!alive) return;
+      setValue(loaded);
+      setReady(true);
+    })();
+    return () => { alive = false; };
+  }, [key]);
+
+  React.useEffect(() => {
+    if (!ready) return;
+    kvSave<T>(key, value);
+  }, [key, value, ready]);
+
+  return [value, setValue, ready];
+}
 
 /** ========== Types & Consts ========== */
 type User = { id: number; name: string; password: string; isAdmin: boolean };
@@ -12,9 +79,9 @@ type CancelRequest = { userId: number; name: string; reason: string };
 type EventItem = {
   id: number;
   title: string;
-  date: string;        // YYYY-MM-DD
-  time: string;        // HH:mm
-  category: string;    // 요일 전시대
+  date: string;   // YYYY-MM-DD
+  time: string;   // HH:mm
+  category: string; // 요일 전시대
   participants: Participant[];
   cancelRequests: CancelRequest[];
   openForApplications: boolean;
@@ -23,9 +90,30 @@ type EventItem = {
 };
 
 const CAPACITY = 4;
-const CATEGORIES = ["월요일","화요일","수요일","목요일","금요일","토요일","일요일"];
+const CATEGORIES = [
+  "월요일","화요일","수요일","목요일","금요일","토요일","일요일",
+];
 
-/** ========== Helpers ========== */
+/** ========== Date utils (no libs) ========== */
+function todayStr(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function addDays(iso: string, n: number): string {
+  const [y,m,d] = iso.split("-").map(Number);
+  const nd = new Date(y, (m||1)-1, d||1);
+  nd.setDate(nd.getDate() + n);
+  const yy = nd.getFullYear();
+  const mm = String(nd.getMonth()+1).padStart(2,"0");
+  const dd = String(nd.getDate()).padStart(2,"0");
+  return `${yy}-${mm}-${dd}`;
+}
+function cmpDate(a: string, b: string) { return a === b ? 0 : (a < b ? -1 : 1); }
+
+/** ========== Responsive helper ========== */
 function useIsMobile(bp = 640) {
   const [m, setM] = React.useState(false);
   React.useEffect(() => {
@@ -36,19 +124,20 @@ function useIsMobile(bp = 640) {
   }, [bp]);
   return m;
 }
-function todayStr(): string {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+
+/** ========== Seed data ========== */
+function initialUsers(): User[] {
+  return [
+    { id: 1, name: "관리자", password: "admin", isAdmin: true },
+    { id: 2, name: "지수", password: "1234", isAdmin: false },
+    { id: 3, name: "민수", password: "1234", isAdmin: false },
+    { id: 4, name: "서연", password: "1234", isAdmin: false },
+  ];
 }
-function cmpDate(a: string, b: string) { return a === b ? 0 : (a < b ? -1 : 1); }
 
 /** ========== Mini UI (no Tailwind) ========== */
-/* CSS 속성 타입 안전! */
 const S = {
-  container: { maxWidth: 960, margin: "0 auto", padding: 16 },
+  container: { maxWidth: 960, margin: "0 auto", padding: 16 } as React.CSSProperties,
   card: {
     border: "1px solid #e6e9ef",
     borderRadius: 12,
@@ -56,7 +145,7 @@ const S = {
     background: "#fff",
     boxShadow: "0 1px 2px rgba(0,0,0,.06)",
     transition: "box-shadow .18s ease, transform .18s ease"
-  },
+  } as React.CSSProperties,
   btn: {
     height: 44, padding: "0 16px",
     background: "#1a73e8", color: "#fff",
@@ -65,35 +154,43 @@ const S = {
     boxShadow: "0 1px 2px rgba(0,0,0,.10)",
     transition: "box-shadow .15s ease, transform .02s ease, background .15s ease",
     display: "inline-flex", alignItems: "center", justifyContent: "center",
-    whiteSpace: "nowrap", wordBreak: "keep-all", flexShrink: 0
-  },
+    whiteSpace: "nowrap", wordBreak: "keep-all" as const, flexShrink: 0
+  } as React.CSSProperties,
   btnGray: {
     height: 44, padding: "0 16px",
     background: "#f1f3f4", color: "#1f1f1f",
     borderRadius: 8, border: "1px solid #e6e9ef",
     cursor: "pointer" as const,
     transition: "box-shadow .15s ease, transform .02s ease, background .15s ease",
-    display: "inline-flex", alignItems: "center", justifyContent: "center",
-    whiteSpace: "nowrap", wordBreak: "keep-all", flexShrink: 0
-  },
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    whiteSpace: "nowrap" as const,
+    wordBreak: "keep-all" as const,
+    flexShrink: 0,
+  } as React.CSSProperties,
   btnRed: {
     height: 44, padding: "0 16px",
     background: "#d93025", color: "#fff",
     borderRadius: 8, border: "1px solid #d93025",
     cursor: "pointer" as const,
     transition: "box-shadow .15s ease, transform .02s ease, background .15s ease",
-    display: "inline-flex", alignItems: "center", justifyContent: "center",
-    whiteSpace: "nowrap", wordBreak: "keep-all", flexShrink: 0
-  },
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    whiteSpace: "nowrap" as const,
+    wordBreak: "keep-all" as const,
+    flexShrink: 0,
+  } as React.CSSProperties,
   input: {
     height: 40, padding: "0 12px",
     border: "1px solid #e6e9ef", borderRadius: 8, width: "100%",
     background: "#fff", outline: "none",
     transition: "border-color .15s ease, box-shadow .15s ease"
-  },
-  label: { fontSize: 12, color: "#5f6368", display: "block", marginBottom: 6 },
-  small: { fontSize: 12, color: "#5f6368", wordBreak: "keep-all" },
-} satisfies Record<string, React.CSSProperties>;
+  } as React.CSSProperties,
+  label: { fontSize: 12, color: "#5f6368", display: "block", marginBottom: 6 } as React.CSSProperties,
+  small: { fontSize: 12, color: "#5f6368", wordBreak: "keep-all" as const } as React.CSSProperties,
+};
 
 function Card(props: React.HTMLAttributes<HTMLDivElement>) { return <div {...props} style={{...S.card, ...(props.style||{})}} />; }
 function Button({ kind="default", style, ...rest }: React.ButtonHTMLAttributes<HTMLButtonElement> & { kind?: "default"|"gray"|"red" }) {
@@ -105,13 +202,28 @@ function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
     <input
       {...props}
       style={{...S.input, ...(props.style||{})}}
-      onFocus={e=>{ e.currentTarget.style.borderColor = "#1a73e8"; e.currentTarget.style.boxShadow = "0 0 0 3px rgba(26,115,232,.15)"; }}
-      onBlur={e=>{ e.currentTarget.style.borderColor = "#e6e9ef"; e.currentTarget.style.boxShadow = "none"; }}
+      onFocus={e=>{
+        e.currentTarget.style.borderColor = "#1a73e8";
+        e.currentTarget.style.boxShadow = "0 0 0 3px rgba(26,115,232,.15)";
+      }}
+      onBlur={e=>{
+        e.currentTarget.style.borderColor = "#e6e9ef";
+        e.currentTarget.style.boxShadow = "none";
+      }}
     />
   );
 }
+
+/** Tiny UI Bits */
 function Chip({ children }: { children: React.ReactNode }) {
-  return <span style={{ fontSize: 12, background:"#f3f4f6", color:"#374151", padding:"4px 10px", borderRadius:999, border:"1px solid #e5e7eb" }}>{children}</span>;
+  return (
+    <span style={{
+      fontSize: 12, background:"#f3f4f6", color:"#374151",
+      padding:"4px 10px", borderRadius:999, border:"1px solid #e5e7eb"
+    }}>
+      {children}
+    </span>
+  );
 }
 function Badge({ tone="green", children }:{ tone?: "green"|"gray"|"red"; children: React.ReactNode }) {
   const map = {
@@ -119,24 +231,36 @@ function Badge({ tone="green", children }:{ tone?: "green"|"gray"|"red"; childre
     gray:  { bg:"#f3f4f6", bd:"#e5e7eb", fg:"#374151" },
     red:   { bg:"#fef2f2", bd:"#fecaca", fg:"#7f1d1d" },
   }[tone];
-  return <span style={{ fontSize: 11, fontWeight:600, background: map.bg, color: map.fg, padding:"3px 8px", borderRadius:999, border:`1px solid ${map.bd}`, letterSpacing:0.2 }}>{children}</span>;
+  return (
+    <span style={{
+      fontSize: 11, fontWeight:600,
+      background: map.bg, color: map.fg,
+      padding:"3px 8px", borderRadius:999, border:`1px solid ${map.bd}`, letterSpacing:0.2
+    }}>{children}</span>
+  );
 }
 
-/** ========== Page ========== */
+/** ========== Page (everything in one file) ========== */
 export default function Home() {
+  // 공유 데이터: users, events → Supabase 연동
+  const [users, setUsers, usersReady] = useShared<User[]>("users", initialUsers());
+  const [events, setEvents, eventsReady] = useShared<EventItem[]>("events", []);
+
+  // 로컬 전용 상태
+  const [currentUserId, setCurrentUserId] = useLocalStorage<number | null>("meet_current_v2", null);
+  const [tab, setTab] = useLocalStorage<"feed"|"calendar"|"create"|"admin">("meet_tab_v2", "feed");
+  const [openCat, setOpenCat] = useLocalStorage<string | null>("meet_feed_cat_open_v2", null);
+
   const isMobile = useIsMobile();
 
-  // 로그인/유저
-  const [users, setUsers] = useState<User[]>([]);
-  const [currentUserId, setCurrentUserId] = useState<number | null>(null);
   const currentUser = users.find(u=>u.id===currentUserId) ?? null;
   const isAdmin = !!currentUser?.isAdmin;
 
-  // 화면 상태
-  const [tab, setTab] = useState<"feed"|"calendar"|"create"|"admin">("feed");
-  const [openCat, setOpenCat] = useState<string | null>(null);
+  // 로그인/가입 상태
+  const [loginName, setLoginName] = useState(""); const [loginPw, setLoginPw] = useState("");
+  const [signupName, setSignupName] = useState(""); const [signupPw, setSignupPw] = useState("");
 
-  // 폼 상태
+  // 생성/수정 폼
   const [editingId, setEditingId] = useState<number | null>(null);
   const [title, setTitle] = useState("");
   const [date, setDate] = useState("");
@@ -146,164 +270,138 @@ export default function Home() {
   const [selectedUserIds, setSelectedUserIds] = useState<number[]>([]);
   const [leaderId, setLeaderId] = useState<number | null>(null);
 
-  // 로그인/회원가입 입력
-  const [loginName, setLoginName] = useState(""); const [loginPw, setLoginPw] = useState("");
-  const [signupName, setSignupName] = useState(""); const [signupPw, setSignupPw] = useState("");
-
-  // 이벤트 데이터
-  const [events, setEvents] = useState<EventItem[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  /** ========== 데이터 로드 ========== */
-  async function loadAll() {
-    setLoading(true);
-    // 1) users
-    const { data: udata, error: uerr } = await supabase.from("app_users").select("*").order("id", { ascending: true });
-    if (!uerr && udata) {
-      setUsers(udata.map(u=>({ id:u.id, name:u.name, password:u.password, isAdmin:u.is_admin })));
-    }
-    // 2) events
-    const { data: edata } = await supabase.from("events").select("*").order("date", { ascending: true }).order("time", { ascending: true });
-
-    // 3) participants
-    const { data: pdata } = await supabase.from("participants").select("event_id,user_id,leader");
-
-    // 4) cancel requests
-    const { data: cdata } = await supabase.from("cancel_requests").select("event_id,user_id,reason");
-
-    // 조합
-    const usersMap = new Map(users.map(u=>[u.id, u.name]));
-    // 최신 usersMap 보장을 위해 udata 기준 다시 만듦
-    if (udata) {
-      for (const u of udata) usersMap.set(u.id, u.name);
-    }
-
-    const evs: EventItem[] = (edata||[]).map(e=>{
-      const parts = (pdata||[]).filter(p=>p.event_id===e.id).map(p=>({
-        id: p.user_id,
-        name: usersMap.get(p.user_id)||`#${p.user_id}`,
-        leader: !!p.leader
-      }));
-      const cancels = (cdata||[]).filter(c=>c.event_id===e.id).map(c=>({
-        userId: c.user_id,
-        name: usersMap.get(c.user_id)||`#${c.user_id}`,
-        reason: c.reason||""
-      }));
-      return {
-        id: e.id,
-        title: e.title,
-        date: e.date,
-        time: e.time,
-        category: e.category,
-        participants: parts,
-        cancelRequests: cancels,
-        openForApplications: !!e.open_for_applications,
-        notifiedToAll: !!e.notified_to_all,
-        repeatWeekly: !!e.repeat_weekly
-      };
-    });
-
-    setEvents(evs);
-    setLoading(false);
+  // Supabase 준비되기 전엔 잠깐 로딩
+  if (!usersReady || !eventsReady) {
+    return (
+      <div style={{minHeight:"100dvh", display:"grid", placeItems:"center"}}>
+        <div style={{fontSize:14, color:"#6b7280"}}>데이터 불러오는 중…</div>
+      </div>
+    );
   }
 
+  /** 지난 일정 자동 삭제 */
   useEffect(()=>{
-    // 로그인 유지(localStorage)
-    try {
-      const saved = window.localStorage.getItem("meet_current_user_id");
-      if (saved) setCurrentUserId(Number(saved));
-    } catch {}
-    loadAll();
-    // 실시간 반영
-    const ch = supabase.channel("realtime-all")
-      .on("postgres_changes", { event:"*", schema:"public", table:"events" }, loadAll)
-      .on("postgres_changes", { event:"*", schema:"public", table:"participants" }, loadAll)
-      .on("postgres_changes", { event:"*", schema:"public", table:"cancel_requests" }, loadAll)
-      .on("postgres_changes", { event:"*", schema:"public", table:"app_users" }, loadAll)
-      .subscribe();
-    return ()=>{ supabase.removeChannel(ch); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[]);
-
-  /** 지난 일정 숨기기(삭제 아님) */
-  const visibleEvents = useMemo(()=>{
     const t = todayStr();
-    return events.filter(e => cmpDate(e.date, t) >= 0);
-  },[events]);
+    setEvents(prev => prev.filter(e => cmpDate(e.date, t) >= 0));
+  },[]); // 최초 한번
 
-  /** 카테고리별 묶기 */
+  /** 반복 일정 자동 생성(다음 일정 7일 전 1개 생성, 앱 열릴 때 체크) */
+  useEffect(()=>{
+    setEvents(prev=>{
+      const list = [...prev];
+      let changed = false;
+      const groups: Record<string, EventItem[]> = {};
+      const keyOf = (e: EventItem)=>`${e.title}|${e.time}|${e.category}`;
+      for(const ev of list){ (groups[keyOf(ev)] ||= []).push(ev); }
+      Object.values(groups).forEach(g=>{
+        const anyRepeat = g.some(x=>x.repeatWeekly);
+        if(!anyRepeat) return;
+        g.sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
+        const last = g[g.length-1];
+        const nextDate = addDays(last.date, 7);
+        const exists = g.some(x=>x.date===nextDate);
+        const shouldGenFrom = addDays(nextDate, -7);
+        if (!exists && todayStr() >= shouldGenFrom) {
+          list.push({
+            ...last,
+            id: Math.max(0, ...list.map(x=>x.id))+1,
+            date: nextDate,
+            repeatWeekly: true,
+            cancelRequests: [],
+            notifiedToAll: false,
+            openForApplications: last.participants.length < CAPACITY,
+          });
+          changed = true;
+        }
+      });
+      return changed ? list : prev;
+    });
+  },[events.length, setEvents]);
+
+  /** 파생값 */
   const feedByCategory = useMemo(()=>{
     const map: Record<string, EventItem[]> = {};
     for(const c of CATEGORIES) map[c] = [];
-    for(const e of visibleEvents) (map[e.category] ||= []).push(e);
+    for(const e of events) (map[e.category] ||= []).push(e);
     for(const c of Object.keys(map)) map[c].sort((a,b)=> (a.date+a.time).localeCompare(b.date+b.time));
     return map;
-  },[visibleEvents]);
+  },[events]);
 
   /** 인증 */
-  async function logIn() {
-    const { data } = await supabase.from("app_users").select("*").eq("name", loginName).eq("password", loginPw).maybeSingle();
-    if (!data) { alert("이름 또는 비밀번호가 올바르지 않습니다."); return; }
-    setCurrentUserId(data.id);
-    try { window.localStorage.setItem("meet_current_user_id", String(data.id)); } catch {}
+  function logIn() {
+    const found = users.find(u=>u.name===loginName && u.password===loginPw);
+    if (!found) { alert("이름 또는 비밀번호가 올바르지 않습니다."); return; }
+    setCurrentUserId(found.id);
     setLoginName(""); setLoginPw("");
-    loadAll();
   }
-  async function signUp() {
+  function signUp() {
     if (!signupName || !signupPw) return;
-    // 중복 체크
-    const { data: ex } = await supabase.from("app_users").select("id").eq("name", signupName).maybeSingle();
-    if (ex) { alert("이미 존재하는 이름입니다."); return; }
-    const { data, error } = await supabase.from("app_users").insert({ name: signupName, password: signupPw, is_admin: false }).select("*").single();
-    if (error) { alert(error.message); return; }
-    alert("가입 완료! 로그인해주세요.");
+    if (users.some(u=>u.name===signupName)) { alert("이미 존재하는 이름입니다."); return; }
+    const newUser: User = { id: Math.max(...users.map(u=>u.id), 0)+1, name: signupName, password: signupPw, isAdmin: false };
+    setUsers([...users, newUser]); alert("가입 완료! 로그인해주세요.");
     setSignupName(""); setSignupPw("");
-    loadAll();
   }
-  function logOut() { setCurrentUserId(null); try { localStorage.removeItem("meet_current_user_id"); } catch {} }
+  function logOut() { setCurrentUserId(null); }
 
   /** 유틸 */
   function isIn(ev: EventItem, uid: number) { return ev.participants.some(p=>p.id===uid); }
   function hasCapacity(ev: EventItem) { return ev.participants.length < CAPACITY; }
 
-  /** 액션: 참가/취소요청/관리자처리 */
-  async function joinEvent(evId: number) {
+  /** 액션 */
+  function joinEvent(evId: number) {
     if (!currentUser) return;
-    const ev = events.find(e=>e.id===evId); if (!ev) return;
-    if (isIn(ev, currentUser.id) || !hasCapacity(ev)) return;
-    const { error } = await supabase.from("participants").insert({ event_id: evId, user_id: currentUser.id, leader: false });
-    if (error) alert(error.message);
-    // 꽉 찼다면 open_for_applications 갱신(선택)
-    await supabase.from("events").update({ open_for_applications: ev.participants.length+1 < CAPACITY }).eq("id", evId);
+    setEvents(prev => prev.map(e=>{
+      if (e.id!==evId) return e;
+      if (isIn(e, currentUser.id) || !hasCapacity(e)) return e;
+      const newList = [...e.participants, { id: currentUser.id, name: currentUser.name, leader: false }];
+      return { ...e, participants: newList, openForApplications: newList.length < CAPACITY };
+    }));
   }
-  async function requestCancel(evId: number, reason="개인 사정") {
+  function requestCancel(evId: number, reason="개인 사정") {
     if (!currentUser) return;
-    const { error } = await supabase.from("cancel_requests").insert({ event_id: evId, user_id: currentUser.id, reason });
-    if (error) alert(error.message);
+    setEvents(prev => prev.map(e=>{
+      if (e.id!==evId || !isIn(e, currentUser.id)) return e;
+      if (e.cancelRequests.some(r=>r.userId===currentUser.id)) return e;
+      return { ...e, cancelRequests: [...e.cancelRequests, { userId: currentUser.id, name: currentUser.name, reason }] };
+    }));
   }
-  async function adminApproveCancel(evId: number, userId: number) {
-    if (!isAdmin) return;
-    await supabase.from("participants").delete().eq("event_id", evId).eq("user_id", userId);
-    await supabase.from("cancel_requests").delete().eq("event_id", evId).eq("user_id", userId);
-    await supabase.from("events").update({ open_for_applications: true }).eq("id", evId);
+  /** 관리자가 취소요청 승인 */
+  function adminApproveCancel(evId: number, userId: number) {
+    if (!currentUser?.isAdmin) return;
+    setEvents(prev => prev.map(e=>{
+      if (e.id !== evId) return e;
+      return {
+        ...e,
+        participants: e.participants.filter(p=>p.id!==userId),
+        cancelRequests: e.cancelRequests.filter(r=>r.userId!==userId),
+        openForApplications: true
+      };
+    }));
   }
-  async function adminRemoveParticipant(evId: number, userId: number) {
-    if (!isAdmin) return;
-    await supabase.from("participants").delete().eq("event_id", evId).eq("user_id", userId);
-    await supabase.from("cancel_requests").delete().eq("event_id", evId).eq("user_id", userId);
-    await supabase.from("events").update({ open_for_applications: true }).eq("id", evId);
+  function adminRemoveParticipant(evId: number, userId: number) {
+    if (!currentUser?.isAdmin) return;
+    setEvents(prev => prev.map(e=>{
+      if (e.id!==evId) return e;
+      return {
+        ...e,
+        participants: e.participants.filter(p=>p.id!==userId),
+        cancelRequests: e.cancelRequests.filter(r=>r.userId!==userId),
+        openForApplications: true
+      };
+    }));
   }
-  async function notifyAllForOpenSlot(evId: number) {
-    if (!isAdmin) return;
-    await supabase.from("events").update({ notified_to_all: true, open_for_applications: true }).eq("id", evId);
+  function notifyAllForOpenSlot(evId: number) {
+    if (!currentUser?.isAdmin) return;
+    setEvents(prev => prev.map(e=> e.id===evId ? { ...e, notifiedToAll: true, openForApplications: true } : e));
     alert("사이트 가입자에게 지원요청 알림이 발송되었다고 가정합니다(모의).");
   }
-  async function applyForSlot(evId: number) {
+  function applyForSlot(evId: number) {
     if (!currentUser) return;
-    const ev = events.find(e=>e.id===evId); if (!ev) return;
-    if (!ev.openForApplications || !hasCapacity(ev) || isIn(ev, currentUser.id)) return;
-    await supabase.from("participants").insert({ event_id: evId, user_id: currentUser.id, leader: false });
-    await supabase.from("events").update({ open_for_applications: ev.participants.length+1 < CAPACITY }).eq("id", evId);
+    setEvents(prev => prev.map(e=>{
+      if (e.id!==evId || !e.openForApplications || !hasCapacity(e) || isIn(e, currentUser.id)) return e;
+      const newList = [...e.participants, { id: currentUser.id, name: currentUser.name, leader: false }];
+      return { ...e, participants: newList, openForApplications: newList.length < CAPACITY };
+    }));
   }
 
   function resetForm() {
@@ -321,59 +419,54 @@ export default function Home() {
     setTab("create");
   }
 
-  async function deleteEvent(evId: number) {
+  function deleteEvent(evId: number) {
     if (!isAdmin) return;
     if (!confirm("이 일정을 삭제할까요?")) return;
-    await supabase.from("events").delete().eq("id", evId);
+    setEvents(prev=> prev.filter(e=>e.id!==evId));
     if (editingId===evId) resetForm();
   }
 
-  async function upsertEvent() {
+  function upsertEvent() {
     if (!isAdmin) { alert("관리자만 일정 생성/수정 가능합니다."); return; }
     if (!title || !date || !time || !category) { alert("제목/날짜/시간/카테고리를 입력해주세요."); return; }
     if (selectedUserIds.length===0 || selectedUserIds.length>CAPACITY) { alert("참여자는 1~4명만 선택 가능합니다."); return; }
     if (!leaderId || !selectedUserIds.includes(leaderId)) { alert("인도자는 선택된 참여자 중 1명을 지정해야 합니다."); return; }
 
+    const participants: Participant[] = selectedUserIds.map(uid=>{
+      const u = users.find(x=>x.id===uid)!;
+      return { id:u.id, name:u.name, leader: uid===leaderId };
+    });
+
     if (editingId) {
-      // 업데이트 + 참가자 전체 교체(간단)
-      await supabase.from("events").update({
-        title, date, time, category,
-        repeat_weekly: repeatWeekly,
-        // 정원 체크해서 열림/닫힘 표시
-        open_for_applications: selectedUserIds.length < CAPACITY
-      }).eq("id", editingId);
-      await supabase.from("participants").delete().eq("event_id", editingId);
-      const rows = selectedUserIds.map(uid=>({ event_id: editingId, user_id: uid, leader: uid===leaderId }));
-      await supabase.from("participants").insert(rows);
+      setEvents(prev => prev.map(e =>
+        e.id===editingId
+          ? { ...e, title, date, time, category, participants, repeatWeekly }
+          : e
+      ));
     } else {
-      // 새로 만들기
-      const { data, error } = await supabase.from("events").insert({
+      const newEvent: EventItem = {
+        id: Math.max(0, ...events.map(e=>e.id)) + 1,
         title, date, time, category,
-        repeat_weekly: repeatWeekly,
-        open_for_applications: selectedUserIds.length < CAPACITY,
-        notified_to_all: false
-      }).select("*").single();
-      if (error || !data) { alert(error?.message || "생성 실패"); return; }
-      const evId = data.id;
-      const rows = selectedUserIds.map(uid=>({ event_id: evId, user_id: uid, leader: uid===leaderId }));
-      await supabase.from("participants").insert(rows);
+        participants,
+        cancelRequests: [],
+        openForApplications: participants.length < CAPACITY,
+        notifiedToAll: false,
+        repeatWeekly
+      };
+      setEvents([newEvent, ...events]);
     }
     resetForm(); setTab("feed");
   }
 
-  async function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
+  /** 관리자: 가입자 생성 */
+  function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
     if (!isAdmin) return;
     if (!name || !pw) { alert("이름/비밀번호를 입력해주세요."); return; }
-    const exist = await supabase.from("app_users").select("id").eq("name", name).maybeSingle();
-    if (exist.data) { alert("이미 존재하는 이름입니다."); return; }
-    await supabase.from("app_users").insert({ name, password: pw, is_admin: makeAdmin });
+    if (users.some(u=>u.name===name)) { alert("이미 존재하는 이름입니다."); return; }
+    const nu: User = { id: Math.max(...users.map(u=>u.id), 0)+1, name, password: pw, isAdmin: makeAdmin };
+    setUsers(prev=>[...prev, nu]);
     alert("가입자를 추가했습니다.");
   }
-
-  /** 자동 반복 생성/지난 일정 삭제
-   *  👉 다유저 환경에서는 서버(스케줄러)에서 처리해야 중복방지 가능
-   *  👉 일단 주석 처리, 나중에 Vercel Cron으로 붙여드릴게요!
-   */
 
   /** 로그인 게이트 */
   if (!currentUser) {
@@ -399,10 +492,6 @@ export default function Home() {
         </div>
       </div>
     );
-  }
-
-  if (loading) {
-    return <div style={{...S.container}}>불러오는 중...</div>;
   }
 
   /** 로그인 상태 화면 */
@@ -449,7 +538,10 @@ export default function Home() {
           <div>
             {CATEGORIES.map(cat=>(
               <div key={cat} style={{marginBottom:16}}>
-                <button onClick={()=> setOpenCat(prev => prev===cat ? null : cat)} style={{...S.card, width:"100%", textAlign:"left"}}>
+                <button
+                  onClick={()=> setOpenCat(prev => prev===cat ? null : cat)}
+                  style={{...S.card, width:"100%", textAlign:"left"}}
+                >
                   <div style={{display:"flex", justifyContent:"space-between"}}>
                     <div>
                       <div style={{fontWeight:600, fontSize:14}}>{cat}</div>
@@ -477,9 +569,13 @@ export default function Home() {
                             <div style={{fontSize:13, color:"#6b7280", marginTop:2}}>
                               {ev.date} • {ev.time}
                             </div>
+
+                            {/* === Chip/Badge 상태줄 === */}
                             <div style={{marginTop:8, display:"flex", gap:8, flexWrap:"wrap", alignItems:"center"}}>
                               {ev.participants.map(p=>(
-                                <Chip key={p.id}>{p.name}{p.leader?" · 인도자":""}</Chip>
+                                <Chip key={p.id}>
+                                  {p.name}{p.leader?" · 인도자":""}
+                                </Chip>
                               ))}
                               <Badge tone={ev.participants.length < CAPACITY ? "green" : "gray"}>
                                 정원 {ev.participants.length}/{CAPACITY}
@@ -488,6 +584,7 @@ export default function Home() {
                               {!ev.openForApplications && ev.participants.length>=CAPACITY && <Badge tone="gray">마감</Badge>}
                             </div>
 
+                            {/* 취소요청 박스 */}
                             {ev.cancelRequests.length>0 && (
                               <div style={{marginTop:12, background:"#f9fafb", border:"1px solid #e5e7eb", borderRadius:10, padding:12}}>
                                 <div style={{fontSize:12, fontWeight:600, marginBottom:6}}>취소요청 ({ev.cancelRequests.length})</div>
@@ -551,9 +648,14 @@ export default function Home() {
         {/* 캘린더(리스트) */}
         {tab==="calendar" && (
           <div style={{marginTop:8, display:"grid", gap:12}}>
-            {[...visibleEvents].sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time)).map(ev=>(
+            {[...events].sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time)).map(ev=>(
               <Card key={ev.id}>
-                <div style={{ display:"flex", flexDirection: isMobile ? "column" : "row", justifyContent: isMobile ? "initial" : "space-between", gap:12 }}>
+                <div style={{
+                  display:"flex",
+                  flexDirection: isMobile ? "column" : "row",
+                  justifyContent: isMobile ? "initial" : "space-between",
+                  gap:12
+                }}>
                   <div>
                     <div style={{fontWeight:600}}>{ev.title}</div>
                     <div style={{fontSize:14, color:"#6b7280"}}>{ev.category} • {ev.date} • {ev.time}</div>
@@ -567,7 +669,7 @@ export default function Home() {
                 </div>
               </Card>
             ))}
-            {visibleEvents.length===0 && <div style={{...S.small}}>등록된 일정이 없어요.</div>}
+            {events.length===0 && <div style={{...S.small}}>등록된 일정이 없어요.</div>}
           </div>
         )}
 
@@ -633,7 +735,7 @@ export default function Home() {
 
                 <label style={{display:"flex", alignItems:"center", gap:8, fontSize:14}}>
                   <input type="checkbox" checked={repeatWeekly} onChange={e=>setRepeatWeekly(e.target.checked)} />
-                  매주 같은 요일/시간으로 자동 생성 (※ 다유저 환경에서는 서버 스케줄로 전환 예정)
+                  매주 같은 요일/시간으로 자동 생성 (다음 일정 7일 전에 자동 추가)
                 </label>
 
                 <div style={{display:"flex", gap:8, flexWrap: isMobile ? "wrap" : undefined}}>
@@ -663,20 +765,25 @@ export default function Home() {
               </div>
             </Card>
 
-            {/* 로컬 데이터 초기화(이제 거의 쓸 일 없음) */}
+            {/* 로컬 데이터 초기화 */}
             <Card>
-              <div style={{fontSize:14, fontWeight:600, marginBottom:8}}>로컬 로그인 정보 초기화</div>
+              <div style={{fontSize:14, fontWeight:600, marginBottom:8}}>로컬 데이터 초기화</div>
               <Button kind="gray" onClick={()=>{
-                try { localStorage.removeItem("meet_current_user_id"); } catch {}
+                localStorage.removeItem("meet_current_v2");
+                localStorage.removeItem("meet_tab_v2");
+                localStorage.removeItem("meet_feed_cat_open_v2");
                 location.reload();
-              }}>현재 기기 로그아웃</Button>
+              }}>초기화 후 새로고침</Button>
+              <div style={{...S.small, marginTop:8}}>
+                ※ users / events는 이제 Supabase에 저장됩니다(kv_store). 이 버튼은 내 브라우저에만 영향.
+              </div>
             </Card>
           </div>
         )}
       </main>
 
       <footer style={{padding:"32px 0", textAlign:"center", fontSize:12, color:"#6b7280"}}>
-        Made with ❤ 방학서부 전시대모임 (Supabase 공유DB · 실시간 반영)
+        Made with ❤ 방학서부 전시대모임 (Supabase 동기화 · 로컬저장 분리 · 관리자도구)
       </footer>
     </div>
   );
