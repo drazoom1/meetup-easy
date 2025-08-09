@@ -46,29 +46,49 @@ async function kvSave<T>(key: string, value: T): Promise<void> {
 
 // 로컬 초기값 → Supabase에서 최초 로드 → 이후 변경 시마다 Supabase에 저장
 // ✅ Supabase 공유 상태 훅 (덮어쓰기 버그 수정 버전)
+// ✅ 공유 상태(useShared) — 실시간 반영 포함
 function useShared<T>(key: string, initial: T): [T, React.Dispatch<React.SetStateAction<T>>, boolean] {
   const [value, setValue] = React.useState<T>(initial);
   const [ready, setReady] = React.useState(false);
 
-  // ☝️ "초기값"은 한 번만 고정해서 사용 (렌더마다 바뀌지 않게)
-  const initialRef = React.useRef(initial);
-
+  // 1) 최초 1회 로드
   React.useEffect(() => {
     let alive = true;
     (async () => {
-      // ⬇️ 여기도 initial 대신 '고정된' initialRef 사용
-      const loaded = await kvLoad<T>(key, initialRef.current);
+      const loaded = await kvLoad<T>(key, initial);
       if (!alive) return;
       setValue(loaded);
       setReady(true);
     })();
     return () => { alive = false; };
-  }, [key]); // ⬅️ ✅ 여기서 'initial' 제거!
+  }, [key, initial]);
 
+  // 2) 값 바뀌면 저장
   React.useEffect(() => {
     if (!ready) return;
     kvSave<T>(key, value);
   }, [key, value, ready]);
+
+  // 3) 🔔 실시간 구독: kv_store에서 해당 key(users/events) 바뀌면 다시 로드
+  React.useEffect(() => {
+    if (!ready) return;
+
+    const channel = supabase
+      .channel(`kv-${key}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'kv_store', filter: `key=eq.${key}` },
+        async () => {
+          const latest = await kvLoad<T>(key, initial);
+          setValue(latest);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [key, ready, initial]);
 
   return [value, setValue, ready];
 }
