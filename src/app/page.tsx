@@ -75,6 +75,19 @@ function addDays(iso: string, n: number): string {
 }
 function cmpDate(a: string, b: string) { return a === b ? 0 : (a < b ? -1 : 1); }
 
+/** ========== Responsive helper ========== */
+function useIsMobile(bp = 640) {
+  const [m, setM] = React.useState(false);
+  React.useEffect(() => {
+    const on = () => setM(window.innerWidth < bp);
+    on();
+    window.addEventListener("resize", on);
+    return () => window.removeEventListener("resize", on);
+  }, [bp]);
+  return m;
+}
+
+
 /** ========== Seed data ========== */
 function initialUsers(): User[] {
   return [
@@ -98,7 +111,7 @@ const S = {
     transition: "box-shadow .18s ease, transform .18s ease"
   },
   btn: {
-    height: 40, padding: "0 16px",
+    height: 44, padding: "0 16px",
     background: "#1a73e8", color: "#fff",
     borderRadius: 8, border: "1px solid #1a73e8",
     cursor: "pointer" as const,
@@ -106,14 +119,14 @@ const S = {
     transition: "box-shadow .15s ease, transform .02s ease, background .15s ease"
   },
   btnGray: {
-    height: 40, padding: "0 16px",
+    height: 44, padding: "0 16px",
     background: "#f1f3f4", color: "#1f1f1f",
     borderRadius: 8, border: "1px solid #e6e9ef",
     cursor: "pointer" as const,
     transition: "box-shadow .15s ease, transform .02s ease, background .15s ease"
   },
   btnRed: {
-    height: 40, padding: "0 16px",
+    height: 44, padding: "0 16px",
     background: "#d93025", color: "#fff",
     borderRadius: 8, border: "1px solid #d93025",
     cursor: "pointer" as const,
@@ -203,6 +216,7 @@ export default function Home() {
   const [repeatWeekly, setRepeatWeekly] = useState(false);
   const [selectedUserIds, setSelectedUserIds] = useState<number[]>([]);
   const [leaderId, setLeaderId] = useState<number | null>(null);
+  
 
   /** 지난 일정 자동 삭제 */
   useEffect(()=>{
@@ -426,6 +440,7 @@ export default function Home() {
         <div style={{...S.container, display:"flex", justifyContent:"space-between", alignItems:"center", paddingTop:12, paddingBottom:12}}>
           <div style={{fontWeight:700}}>방학서부 전시대모임</div>
           <div style={{display:"flex", alignItems:"center", gap:12, color:"#4b5563", fontSize:14}}>
+
             <span>현재 사용자: <b>{currentUser.name}</b>{isAdmin?" (관리자)":""}</span>
             <Button kind="gray" onClick={()=>setTab("feed")}>전시대일정</Button>
             <Button kind="gray" onClick={()=>setTab("calendar")}>캘린더</Button>
@@ -462,7 +477,13 @@ export default function Home() {
                     )}
                     {(feedByCategory[cat]||[]).map(ev=>(
                       <Card key={ev.id}>
-                        <div style={{display:"flex", justifyContent:"space-between", gap:12}}>
+                        <div style={{
+                              display:"flex",
+                              flexDirection: isMobile ? "column" : "row",
+                              justifyContent: isMobile ? "initial" : "space-between",
+                              gap:12
+                            }}>
+
                           <div>
                             <div style={{fontWeight:700, fontSize:16}}>{ev.title}</div>
                             <div style={{fontSize:13, color:"#6b7280", marginTop:2}}>
@@ -505,7 +526,15 @@ export default function Home() {
                             {ev.notifiedToAll && <div style={{...S.small, color:"#059669", marginTop:6}}>지원요청 알림이 발송되었어요(모의)</div>}
                           </div>
 
-                          <div style={{display:"flex", flexDirection:"column", gap:8, minWidth:180}}>
+                            <div style={{
+                              display:"flex",
+                              flexDirection: isMobile ? "row" : "column",
+                              gap:8,
+                              minWidth: isMobile ? 0 : 180,
+                              width: isMobile ? "100%" : undefined,
+                              marginTop: isMobile ? 8 : 0,
+                              flexWrap: isMobile ? "wrap" : undefined
+                            }}>
                             {/* 참여/취소/지원 */}
                             {!isIn(ev, currentUser.id) && hasCapacity(ev) && (
                               <Button onClick={()=>joinEvent(ev.id)}>지원</Button>
@@ -540,7 +569,12 @@ export default function Home() {
           <div style={{marginTop:8, display:"grid", gap:12}}>
             {[...events].sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time)).map(ev=>(
               <Card key={ev.id}>
-                <div style={{display:"flex", justifyContent:"space-between", gap:12}}>
+                  <div style={{
+                    display:"flex",
+                    flexDirection: isMobile ? "column" : "row",
+                    justifyContent: isMobile ? "initial" : "space-between",
+                    gap:12
+                  }}>
                   <div>
                     <div style={{fontWeight:600}}>{ev.title}</div>
                     <div style={{fontSize:14, color:"#6b7280"}}>{ev.category} • {ev.date} • {ev.time}</div>
@@ -623,7 +657,7 @@ export default function Home() {
                   매주 같은 요일/시간으로 자동 생성 (다음 일정 7일 전에 자동 추가)
                 </label>
 
-                <div style={{display:"flex", gap:8}}>
+                <div style={{display:"flex", gap:8, flexWrap: isMobile ? "wrap" : undefined}}>
                   <Button onClick={upsertEvent}>{editingId ? "일정 수정" : "일정 생성"}</Button>
                   {editingId && <Button kind="gray" onClick={resetForm}>취소</Button>}
                 </div>
