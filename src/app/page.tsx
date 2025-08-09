@@ -2,7 +2,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import { supabase } from "@/lib/supabaseClient"; // ✅ Supabase 클라이언트
+import { supabase } from "./lib/supabaseClient"; // ✅ Supabase 클라이언트
 
 /** ========== LocalStorage helpers (로컬 전용 상태에 사용) ========== */
 function safeParse<T>(v: string | null, fallback: T): T {
