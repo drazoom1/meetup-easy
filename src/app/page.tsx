@@ -4,9 +4,50 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { supabase } from "./lib/supabaseClient"; // ✅ Supabase 클라이언트
 
+// === TZ utils (UTC 저장 / KST 표시) ===
+const KST_OFFSET_MIN = 9 * 60; // Asia/Seoul 고정, DST 없음
+
+function kstToUtcISO(dateStr: string, timeStr: string) {
+  // dateStr: 'YYYY-MM-DD', timeStr: 'HH:mm'
+  const local = new Date(`${dateStr}T${timeStr}:00`);         // 브라우저 로컬 파싱
+  const utcMs = local.getTime() - KST_OFFSET_MIN * 60 * 1000; // KST → UTC
+  return new Date(utcMs).toISOString();                       // ex) '2025-08-10T03:24:00.000Z'
+}
+
+function utcISOToKst(iso: string) {
+  const d = new Date(iso);
+  const kstMs = d.getTime() + KST_OFFSET_MIN * 60 * 1000;
+  const k = new Date(kstMs);
+  const y = k.getFullYear();
+  const m = String(k.getMonth()+1).padStart(2,'0');
+  const dd = String(k.getDate()).padStart(2,'0');
+  const hh = String(k.getHours()).padStart(2,'0');
+  const mm = String(k.getMinutes()).padStart(2,'0');
+  return { date: `${y}-${m}-${dd}`, time: `${hh}:${mm}` };
+}
+
+// 날짜만 다룰 때 +7일 (KST 안전: 정오 고정)
+function add7KstSafe(dateStr: string) {
+  const d = new Date(dateStr + 'T12:00:00'); // KST 하루 밀림 방지
+  d.setDate(d.getDate() + 7);
+  return d.toISOString().slice(0,10);        // 'YYYY-MM-DD'
+}
+
+// 안정 비교용 직렬화
+function j(v: unknown) {
+  try { return JSON.stringify(v); } catch { return ""; }
+}
+
+// 고유 ID (동시 생성 충돌 방지)
+function makeId(existing: {id:number}[]) {
+  let id = Date.now();
+  while (existing.some(x=>x.id===id)) id++;
+  return id;
+}
+
 /** ========== LocalStorage helpers (로컬 전용 상태에 사용) ========== */
 function useLocalStorage<T>(key: string, initialValue: T): [T, React.Dispatch<React.SetStateAction<T>>, boolean] {
-  const [value, setValue] = React.useState(initialValue);
+  const [value, setValue] = React.useState(initialValue as T);
   const [ready, setReady] = React.useState(false);
   React.useEffect(() => {
     try {
@@ -40,16 +81,17 @@ async function kvLoad<T>(key: string, fallback: T): Promise<T> {
 async function kvSave<T>(key: string, value: T): Promise<void> {
   const { error } = await supabase
     .from("kv_store")
-    .upsert({ key, value }, { onConflict: "key" });
+    .upsert({ key, value }, { onConflict: "key"/*, returning: "minimal"*/ });
   if (error) console.warn("kv save error", key, error);
 }
 
-// 로컬 초기값 → Supabase에서 최초 로드 → 이후 변경 시마다 Supabase에 저장
-// ✅ Supabase 공유 상태 훅 (덮어쓰기 버그 수정 버전)
-// ✅ 공유 상태(useShared) — 실시간 반영 포함
+// ✅ Supabase 공유 상태 훅 (루프/레이스 방지 강화 + 실시간 반영 안정화)
 function useShared<T>(key: string, initial: T): [T, React.Dispatch<React.SetStateAction<T>>, boolean] {
   const [value, setValue] = React.useState<T>(initial);
   const [ready, setReady] = React.useState(false);
+  const subInitRef = React.useRef(false);        // 구독 중복 방지
+  const lastSavedStr = React.useRef<string>(""); // 마지막으로 저장한 스냅샷
+  const saveTimer = React.useRef<number | null>(null);
 
   // 1) 최초 1회 로드
   React.useEffect(() => {
@@ -58,20 +100,33 @@ function useShared<T>(key: string, initial: T): [T, React.Dispatch<React.SetStat
       const loaded = await kvLoad<T>(key, initial);
       if (!alive) return;
       setValue(loaded);
+      lastSavedStr.current = j(loaded);
       setReady(true);
     })();
     return () => { alive = false; };
   }, [key, initial]);
 
-  // 2) 값 바뀌면 저장
-  React.useEffect(() => {
-    if (!ready) return;
-    kvSave<T>(key, value);
-  }, [key, value, ready]);
+  // 2) 값 바뀌면 저장 — 디바운스 + 변경 감지
+  const scheduleSave = React.useCallback((cur: T) => {
+    const curStr = j(cur);
+    if (curStr === lastSavedStr.current) return; // 변경 없음
+    if (saveTimer.current) window.clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(async () => {
+      await kvSave<T>(key, cur);
+      lastSavedStr.current = j(cur);
+    }, 250) as unknown as number;
+  }, [key]);
 
-  // 3) 🔔 실시간 구독: kv_store에서 해당 key(users/events) 바뀌면 다시 로드
   React.useEffect(() => {
     if (!ready) return;
+    scheduleSave(value);
+  }, [value, ready, scheduleSave]);
+
+  // 3) 🔔 실시간 구독: kv_store의 해당 key가 바뀌면 re-load
+  React.useEffect(() => {
+    if (!ready) return;
+    if (subInitRef.current) return;
+    subInitRef.current = true;
 
     const channel = supabase
       .channel(`kv-${key}`)
@@ -80,13 +135,18 @@ function useShared<T>(key: string, initial: T): [T, React.Dispatch<React.SetStat
         { event: '*', schema: 'public', table: 'kv_store', filter: `key=eq.${key}` },
         async () => {
           const latest = await kvLoad<T>(key, initial);
-          setValue(latest);
+          const latestStr = j(latest);
+          if (latestStr !== lastSavedStr.current) {
+            lastSavedStr.current = latestStr; // 🔒 저장 루프 방지
+            setValue(latest);
+          }
         }
       )
       .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
+      subInitRef.current = false;
     };
   }, [key, ready, initial]);
 
@@ -134,6 +194,17 @@ function addDays(iso: string, n: number): string {
   return `${yy}-${mm}-${dd}`;
 }
 function cmpDate(a: string, b: string) { return a === b ? 0 : (a < b ? -1 : 1); }
+
+// ✅ 여기 추가
+function isPastEvent(ev: EventItem) {
+  // 시간이 있으면 KST 기준 시작시각이 현재보다 이전인지 확인
+  if (ev.time) {
+    const startISO = kstToUtcISO(ev.date, ev.time);
+    return new Date(startISO) < new Date();
+  }
+  // 시간이 없으면 날짜만 비교
+  return cmpDate(ev.date, todayStr()) < 0;
+}
 
 /** ========== Responsive helper ========== */
 function useIsMobile(bp = 640) {
@@ -292,67 +363,131 @@ export default function Home() {
   const [selectedUserIds, setSelectedUserIds] = useState<number[]>([]);
   const [leaderId, setLeaderId] = useState<number | null>(null);
 
-  // Supabase 준비되기 전엔 잠깐 로딩
+  // ⏱ 미래 시각이 지나면 자동으로 렌더 트리거 (15초 간격)
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 15000);
+    return () => clearInterval(t);
+  }, []);
 
+  /** 지난 일정 자동 삭제 — 완료 후 3일 경과 시 제거 */
+  useEffect(() => {
+    if (!eventsReady) return;
 
-/** 지난 일정 자동 삭제 */
-useEffect(() => {
-  if (!eventsReady) return;
-  const t = todayStr();
-  setEvents(prev => prev.filter(e => cmpDate(e.date, t) >= 0));
-}, [eventsReady, setEvents]);  // ✅ 딱 여기서 깔끔히 끝.
+    const now = new Date(); // UTC now
+    const cutoffMs = 3 * 24 * 60 * 60 * 1000;
+    const cutoff = new Date(now.getTime() - cutoffMs); // 3일 전
 
-/** 반복 일정 자동 생성(다음 일정 7일 전 1개 생성) */
-useEffect(() => {
-  if (!eventsReady) return;
+    setEvents(prev => prev.filter(e => {
+      if (e.time) {
+        const startISO = kstToUtcISO(e.date, e.time);
+        return new Date(startISO) >= cutoff;
+      }
+      const keepDate = addDays(todayStr(), -3); // 오늘-3일
+      return cmpDate(e.date, keepDate) >= 0;
+    }));
+  }, [eventsReady, setEvents, nowTick]);
 
-  setEvents(prev => {
-    const list = [...prev];
-    let changed = false;
+  /** 반복 일정 자동 생성(“방금 지난” 일정 기준으로 +7일 1개 생성) */
+  useEffect(() => {
+    if (!eventsReady) return;
 
-    const groups: Record<string, EventItem[]> = {};
-    const keyOf = (e: EventItem) => `${e.title}|${e.time}|${e.category}`;
-    for (const ev of list) (groups[keyOf(ev)] ||= []).push(ev);
+    setEvents(prev => {
+      const list = [...prev];
+      let changed = false;
 
-    Object.values(groups).forEach(g => {
-      if (!g.some(x => x.repeatWeekly)) return;
-      g.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
-      const last = g[g.length - 1];
+      // group by title|time|category
+      const groups: Record<string, EventItem[]> = {};
+      const keyOf = (e: EventItem) => `${e.title}|${e.time}|${e.category}`;
+      for (const ev of list) (groups[keyOf(ev)] ||= []).push(ev);
 
-      const nextDate = addDays(last.date, 7);
-      const exists = g.some(x => x.date === nextDate);
-      const shouldGenFrom = addDays(nextDate, -7);
+      const now = new Date();
 
-      if (!exists && todayStr() >= shouldGenFrom) {
-        list.push({
-          ...last,
-          id: Math.max(0, ...list.map(x => x.id)) + 1,
+      Object.values(groups).forEach(g => {
+        // 반복 옵션 있는 그룹만
+        if (!g.some(x => x.repeatWeekly)) return;
+
+        // 시간 오름차순
+        g.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+
+        // ✅ “지금 기준으로 이미 시작된 것들” 중 가장 최근(= 방금 지난 카드)
+        const recentlyPassed = [...g].reverse().find(item => {
+          const startISO = kstToUtcISO(item.date, item.time);
+          return new Date(startISO) <= now;
+        });
+        if (!recentlyPassed) return;
+
+        // ✅ 그 카드 기준 +7일 생성 (이미 있으면 스킵)
+        const nextDate = add7KstSafe(recentlyPassed.date);
+        const exists = g.some(x => x.date === nextDate && x.time === recentlyPassed.time);
+        if (exists) return;
+
+        const newItem: EventItem = {
+          ...recentlyPassed,
+          id: makeId(list),
           date: nextDate,
-          repeatWeekly: true,
           cancelRequests: [],
           notifiedToAll: false,
-          openForApplications: last.participants.length < CAPACITY,
-        });
+          openForApplications: recentlyPassed.participants.length < CAPACITY,
+          repeatWeekly: true,
+        };
+        list.push(newItem);
         changed = true;
-      }
+      });
+
+      return changed ? list : prev;
     });
+  }, [eventsReady, setEvents, nowTick]);
 
-    return changed ? list : prev;
-  });
-}, [eventsReady, setEvents, events.length]); // ✅ 여기도 여기서 끝.
-
-
-  /** 파생값 */
+  /** 파생값 — 한국시간 도달 전 카드는 숨기고, 도달하면 자동 표시 */
+/** 파생값 — 전시대일정: 과거/현재 + 각 그룹의 '최초 미래 1개'까지 표시 */
 const feedByCategory = useMemo(() => {
   if (!eventsReady) return {} as Record<string, EventItem[]>;
   const map: Record<string, EventItem[]> = {};
   for (const c of CATEGORIES) map[c] = [];
-  for (const e of events) (map[e.category] ||= []).push(e);
+
+  void nowTick; // 15초마다 재평가
+
+  const now = new Date();
+
+  // 1) 그룹핑: 동일한 title|time|category
+  const keyOf = (e: EventItem) => `${e.title}|${e.time}|${e.category}`;
+  const groups: Record<string, EventItem[]> = {};
+  for (const e of events) (groups[keyOf(e)] ||= []).push(e);
+
+  // 2) 각 그룹 처리
+  Object.values(groups).forEach(g => {
+    // 시간 오름차순 정렬
+    g.sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
+
+    // (a) 과거/현재 도달한 카드 전부 포함
+    const reached: EventItem[] = [];
+    const future: EventItem[] = [];
+
+    for (const e of g) {
+      if (!e.time) { // 시간이 없는 카드는 항상 보이기
+        reached.push(e);
+        continue;
+      }
+      const startISO = kstToUtcISO(e.date, e.time);
+      (new Date(startISO) <= now ? reached : future).push(e);
+    }
+
+    // (b) 미래 중 '가장 가까운 1개'만 예외적으로 포함
+    const firstFuture = future[0] ?? null;
+
+    // 카테고리로 분배
+    for (const e of reached) (map[e.category] ||= []).push(e);
+    if (firstFuture) (map[firstFuture.category] ||= []).push(firstFuture);
+  });
+
+  // 3) 각 카테고리 정렬
   for (const c of Object.keys(map)) {
-    map[c].sort((a,b)=> (a.date+a.time).localeCompare(b.date+b.time));
+    map[c].sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
   }
+
   return map;
-}, [events, eventsReady]);
+}, [events, eventsReady, nowTick]);
 
   /** 인증 */
   function logIn() {
@@ -449,7 +584,15 @@ const feedByCategory = useMemo(() => {
   function deleteEvent(evId: number) {
     if (!isAdmin) return;
     if (!confirm("이 일정을 삭제할까요?")) return;
-    setEvents(prev=> prev.filter(e=>e.id!==evId));
+
+    // 로컬 즉시 반영 + 서버 즉시 저장(디바운스 대기 X)
+    setEvents(prev => {
+      const next = prev.filter(e=>e.id!==evId);
+      // 🔥 즉시 플러시 (서버 반영 지연으로 복귀되는 현상 방지)
+      kvSave("events", next).catch(err=>console.warn("immediate delete save error", err));
+      return next;
+    });
+
     if (editingId===evId) resetForm();
   }
 
@@ -465,56 +608,55 @@ const feedByCategory = useMemo(() => {
     });
 
     if (editingId) {
-      setEvents(prev => prev.map(e =>
-        e.id===editingId
-          ? { ...e, title, date, time, category, participants, repeatWeekly }
-          : e
-      ));
+      setEvents(prev => {
+        const next = prev.map(e =>
+          e.id===editingId
+            ? { ...e, title, date, time, category, participants, repeatWeekly }
+            : e
+        );
+        // 수정은 디바운스 저장으로 충분 (즉시 플러시는 생략 가능)
+        return next;
+      });
     } else {
-      const newEvent: EventItem = {
-        id: Math.max(0, ...events.map(e=>e.id)) + 1,
-        title, date, time, category,
-        participants,
-        cancelRequests: [],
-        openForApplications: participants.length < CAPACITY,
-        notifiedToAll: false,
-        repeatWeekly
-      };
-      setEvents([newEvent, ...events]);
+      setEvents(prev => {
+        const newEvent: EventItem = {
+          id: makeId(prev),
+          title, date, time, category,
+          participants,
+          cancelRequests: [],
+          openForApplications: participants.length < CAPACITY,
+          notifiedToAll: false,
+          repeatWeekly
+        };
+        const next = [newEvent, ...prev];
+        // 생성은 체감 위해 즉시 저장 플러시
+        kvSave("events", next).catch(()=>{});
+        return next;
+      });
     }
     resetForm(); setTab("feed");
   }
 
   /** 관리자: 가입자 생성 */
-function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
-  if (!isAdmin) return;
+  function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
+    if (!isAdmin) return;
+    if (!usersReady) { alert("데이터 동기화 중입니다. 1~2초 후 다시 시도해주세요."); return; }
+    if (!name || !pw) { alert("이름/비밀번호를 입력해주세요."); return; }
+    if (users.some(u => u.name === name)) { alert("이미 존재하는 이름입니다."); return; }
 
-  // ✅ 동기화 중일 때 막기
-  if (!usersReady) {
-    alert("데이터 동기화 중입니다. 1~2초 후 다시 시도해주세요.");
-    return;
+    const nu: User = {
+      id: Math.max(...users.map(u => u.id), 0) + 1,
+      name,
+      password: pw,
+      isAdmin: makeAdmin,
+    };
+    setUsers(prev => {
+      const next = [...prev, nu];
+      kvSave("users", next).catch(()=>{});
+      return next;
+    });
+    alert("가입자를 추가했습니다.");
   }
-
-  if (!name || !pw) {
-    alert("이름/비밀번호를 입력해주세요.");
-    return;
-  }
-
-  if (users.some(u => u.name === name)) {
-    alert("이미 존재하는 이름입니다.");
-    return;
-  }
-
-  const nu: User = {
-    id: Math.max(...users.map(u => u.id), 0) + 1,
-    name,
-    password: pw,
-    isAdmin: makeAdmin,
-  };
-
-  setUsers(prev => [...prev, nu]);
-  alert("가입자를 추가했습니다.");
-}
 
   /** 로그인 게이트 */
   if (!currentUser) {
@@ -604,88 +746,110 @@ function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
                     {(feedByCategory[cat]||[]).length===0 && (
                       <div style={{...S.small, paddingLeft:8}}>이 카테고리에 일정이 없어요.</div>
                     )}
-                    {(feedByCategory[cat]||[]).map(ev=>(
-                      <Card key={ev.id}>
-                        <div style={{
-                          display:"flex",
-                          flexDirection: isMobile ? "column" : "row",
-                          justifyContent: isMobile ? "initial" : "space-between",
-                          gap:12
-                        }}>
-                          <div>
-                            <div style={{fontWeight:700, fontSize:16}}>{ev.title}</div>
-                            <div style={{fontSize:13, color:"#6b7280", marginTop:2}}>
-                              {ev.date} • {ev.time}
-                            </div>
+{(feedByCategory[cat]||[]).map(ev=>{
+  const past = isPastEvent(ev); // ✅ 지난 카드 판단 (앞서 추가한 유틸 사용)
+  const isFuture = ev.time ? new Date(kstToUtcISO(ev.date, ev.time)) > new Date() : false;
 
-                            {/* === Chip/Badge 상태줄 === */}
-                            <div style={{marginTop:8, display:"flex", gap:8, flexWrap:"wrap", alignItems:"center"}}>
-                              {ev.participants.map(p=>(
-                                <Chip key={p.id}>
-                                  {p.name}{p.leader?" · 인도자":""}
-                                </Chip>
-                              ))}
-                              <Badge tone={ev.participants.length < CAPACITY ? "green" : "gray"}>
-                                정원 {ev.participants.length}/{CAPACITY}
-                              </Badge>
-                              {ev.openForApplications && <Badge tone="green">지원 열림</Badge>}
-                              {!ev.openForApplications && ev.participants.length>=CAPACITY && <Badge tone="gray">마감</Badge>}
-                            </div>
+  return (
+    <Card
+      key={ev.id}
+      style={past ? {
+        // ✅ 지난 카드면 톤 다운
+        background: "#f8fafc",
+        border: "1px solid #d1d5db",
+        opacity: 0.9,
+        filter: "grayscale(0.1)"
+      } : undefined}
+    >
+      <div style={{
+        display:"flex",
+        flexDirection: isMobile ? "column" : "row",
+        justifyContent: isMobile ? "initial" : "space-between",
+        gap:12
+      }}>
+        <div>
+          <div style={{fontWeight:700, fontSize:16}}>{ev.title}</div>
+          <div style={{fontSize:13, color: past ? "#4b5563" : "#6b7280", marginTop:2}}>
+            {ev.date} • {ev.time}
+          </div>
 
-                            {/* 취소요청 박스 */}
-                            {ev.cancelRequests.length>0 && (
-                              <div style={{marginTop:12, background:"#f9fafb", border:"1px solid #e5e7eb", borderRadius:10, padding:12}}>
-                                <div style={{fontSize:12, fontWeight:600, marginBottom:6}}>취소요청 ({ev.cancelRequests.length})</div>
-                                <div style={{display:"grid", gap:6}}>
-                                  {ev.cancelRequests.map(r=>(
-                                    <div key={r.userId} style={{display:"flex", justifyContent:"space-between", fontSize:14, alignItems:"center"}}>
-                                      <div><b>{r.name}</b> <span style={{color:"#6b7280"}}>{r.reason}</span></div>
-                                      {isAdmin && (
-                                        <div style={{display:"flex", gap:6}}>
-                                          <Button kind="gray" onClick={()=>adminApproveCancel(ev.id, r.userId)}>승인</Button>
-                                          <Button kind="red" onClick={()=>adminRemoveParticipant(ev.id, r.userId)}>삭제</Button>
-                                        </div>
-                                      )}
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-                            {ev.notifiedToAll && <div style={{...S.small, color:"#059669", marginTop:6}}>지원요청 알림이 발송되었어요(모의)</div>}
-                          </div>
+          {/* === Chip/Badge 상태줄 === */}
+          <div style={{marginTop:8, display:"flex", gap:8, flexWrap:"wrap", alignItems:"center"}}>
+            {ev.participants.map(p=>(
+              <Chip key={p.id}>
+                {p.name}{p.leader?" · 인도자":""}
+              </Chip>
+            ))}
 
-                          <div style={{
-                            display:"flex",
-                            flexDirection: isMobile ? "row" : "column",
-                            gap:8,
-                            minWidth: isMobile ? 0 : 180,
-                            width: isMobile ? "100%" : undefined,
-                            marginTop: isMobile ? 8 : 0,
-                            flexWrap: isMobile ? "nowrap" : undefined,
-                            overflowX: isMobile ? "auto" : undefined,
-                            whiteSpace: isMobile ? "nowrap" : undefined,
-                            WebkitOverflowScrolling: isMobile ? "touch" : undefined
-                          }}>
-                            {!isIn(ev, currentUser.id) && hasCapacity(ev) && (
-                              <Button onClick={()=>joinEvent(ev.id)}>지원</Button>
-                            )}
-                            {isIn(ev, currentUser.id) && (
-                              <Button kind="gray" onClick={()=>requestCancel(ev.id)}>취소요청</Button>
-                            )}
-                            {!isIn(ev, currentUser.id) && !hasCapacity(ev) && ev.openForApplications && (
-                              <Button onClick={()=>applyForSlot(ev.id)}>빈자리 지원(선착순)</Button>
-                            )}
-                            {isAdmin && (
-                              <>
-                                <Button kind="gray" onClick={()=>notifyAllForOpenSlot(ev.id)}>지원요청 알림</Button>
-                                <Button kind="gray" onClick={()=>startEdit(ev)}>수정</Button>
-                                <Button kind="red" onClick={()=>deleteEvent(ev.id)}>삭제</Button>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                      </Card>
-                    ))}
+            <Badge tone={ev.participants.length < CAPACITY ? "green" : "gray"}>
+              정원 {ev.participants.length}/{CAPACITY}
+            </Badge>
+
+            {ev.openForApplications && <Badge tone="green">지원 열림</Badge>}
+            {!ev.openForApplications && ev.participants.length>=CAPACITY && <Badge tone="gray">마감</Badge>}
+
+            {/* (선택) 미래 일정 달 때 '예정' 뱃지 */}
+            {isFuture && <Badge tone="gray">예정</Badge>}
+
+            {/* (선택) 지난 일정 표시 */}
+            {past && <Badge tone="red">지남</Badge>}
+          </div>
+
+          {/* 취소요청 영역 등 기존 내용은 그대로 유지 */}
+          {ev.cancelRequests.length>0 && (
+            <div style={{marginTop:12, background:"#f9fafb", border:"1px solid #e5e7eb", borderRadius:10, padding:12}}>
+              <div style={{fontSize:12, fontWeight:600, marginBottom:6}}>취소요청 ({ev.cancelRequests.length})</div>
+              <div style={{display:"grid", gap:6}}>
+                {ev.cancelRequests.map(r=>(
+                  <div key={r.userId} style={{display:"flex", justifyContent:"space-between", fontSize:14, alignItems:"center"}}>
+                    <div><b>{r.name}</b> <span style={{color:"#6b7280"}}>{r.reason}</span></div>
+                    {isAdmin && (
+                      <div style={{display:"flex", gap:6}}>
+                        <Button kind="gray" onClick={()=>adminApproveCancel(ev.id, r.userId)}>승인</Button>
+                        <Button kind="red" onClick={()=>adminRemoveParticipant(ev.id, r.userId)}>삭제</Button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {ev.notifiedToAll && <div style={{...S.small, color:"#059669", marginTop:6}}>지원요청 알림이 발송되었어요(모의)</div>}
+        </div>
+
+        <div style={{
+          display:"flex",
+          flexDirection: isMobile ? "row" : "column",
+          gap:8,
+          minWidth: isMobile ? 0 : 180,
+          width: isMobile ? "100%" : undefined,
+          marginTop: isMobile ? 8 : 0,
+          flexWrap: isMobile ? "nowrap" : undefined,
+          overflowX: isMobile ? "auto" : undefined,
+          whiteSpace: isMobile ? "nowrap" : undefined,
+          WebkitOverflowScrolling: isMobile ? "touch" : undefined
+        }}>
+          {!isIn(ev, currentUser.id) && hasCapacity(ev) && (
+            <Button onClick={()=>joinEvent(ev.id)}>지원</Button>
+          )}
+          {isIn(ev, currentUser.id) && (
+            <Button kind="gray" onClick={()=>requestCancel(ev.id)}>취소요청</Button>
+          )}
+          {!isIn(ev, currentUser.id) && !hasCapacity(ev) && ev.openForApplications && (
+            <Button onClick={()=>applyForSlot(ev.id)}>빈자리 지원(선착순)</Button>
+          )}
+          {isAdmin && (
+            <>
+              <Button kind="gray" onClick={()=>notifyAllForOpenSlot(ev.id)}>지원요청 알림</Button>
+              <Button kind="gray" onClick={()=>startEdit(ev)}>수정</Button>
+              <Button kind="red" onClick={()=>deleteEvent(ev.id)}>삭제</Button>
+            </>
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+})}
                   </div>
                 )}
               </div>
@@ -696,28 +860,41 @@ function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
         {/* 캘린더(리스트) */}
         {tab==="calendar" && (
           <div style={{marginTop:8, display:"grid", gap:12}}>
-            {[...events].sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time)).map(ev=>(
-              <Card key={ev.id}>
-                <div style={{
-                  display:"flex",
-                  flexDirection: isMobile ? "column" : "row",
-                  justifyContent: isMobile ? "initial" : "space-between",
-                  gap:12
-                }}>
-                  <div>
-                    <div style={{fontWeight:600}}>{ev.title}</div>
-                    <div style={{fontSize:14, color:"#6b7280"}}>{ev.category} • {ev.date} • {ev.time}</div>
-                  </div>
-                  {isAdmin && (
-                    <div style={{display:"flex", gap:8}}>
-                      <Button kind="gray" onClick={()=>startEdit(ev)}>수정</Button>
-                      <Button kind="red" onClick={()=>deleteEvent(ev.id)}>삭제</Button>
-                    </div>
+            {(() => {
+              void nowTick; // 15초마다 재평가
+              const visible = [...events]
+                .sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
+              return (
+                <>
+                  {visible.map(ev=>(
+                    <Card key={ev.id}>
+                      <div style={{
+                        display:"flex",
+                        flexDirection: isMobile ? "column" : "row",
+                        justifyContent: isMobile ? "initial" : "space-between",
+                        gap:12
+                      }}>
+                        <div>
+                          <div style={{fontWeight:600}}>{ev.title}</div>
+                          <div style={{fontSize:14, color:"#6b7280"}}>
+                            {ev.category} • {ev.date} • {ev.time}
+                          </div>
+                        </div>
+                        {isAdmin && (
+                          <div style={{display:"flex", gap:8}}>
+                            <Button kind="gray" onClick={()=>startEdit(ev)}>수정</Button>
+                            <Button kind="red" onClick={()=>deleteEvent(ev.id)}>삭제</Button>
+                          </div>
+                        )}
+                      </div>
+                    </Card>
+                  ))}
+                  {visible.length===0 && (
+                    <div style={{...S.small}}>등록된 일정이 없어요.</div>
                   )}
-                </div>
-              </Card>
-            ))}
-            {events.length===0 && <div style={{...S.small}}>등록된 일정이 없어요.</div>}
+                </>
+              );
+            })()}
           </div>
         )}
 
@@ -823,7 +1000,7 @@ function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
                 location.reload();
               }}>초기화 후 새로고침</Button>
               <div style={{...S.small, marginTop:8}}>
-                ※ users / events는 이제 Supabase에 저장됩니다(kv_store). 이 버튼은 내 브라우저에만 영향.
+                ※ users / events는 Supabase의 kv_store에 저장됩니다. 이 버튼은 내 브라우저에만 영향.
               </div>
             </Card>
           </div>
@@ -840,7 +1017,7 @@ function adminCreateUser(name: string, pw: string, makeAdmin: boolean) {
 /** ========== 하위: 관리자 가입자 추가 ========== */
 function AdminUserCreator({
   onCreate,
-  disabled = false, // ✅ 비활성화 prop 추가
+  disabled = false,
 }: {
   onCreate: (name: string, pw: string, isAdmin: boolean) => void;
   disabled?: boolean;
@@ -856,7 +1033,7 @@ function AdminUserCreator({
         gridTemplateColumns: "1.5fr 1.5fr 1fr 1fr",
         gap: 8,
         alignItems: "end",
-        opacity: disabled ? 0.6 : 1, // ✅ 동기화 중 흐리게
+        opacity: disabled ? 0.6 : 1,
       }}
     >
       <div>
@@ -865,7 +1042,7 @@ function AdminUserCreator({
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="예: 홍길동"
-          disabled={disabled} // ✅ 입력 비활성화
+          disabled={disabled}
         />
       </div>
       <div>
@@ -894,7 +1071,7 @@ function AdminUserCreator({
           setPw("");
           setAdmin(false);
         }}
-        disabled={disabled} // ✅ 버튼 비활성화
+        disabled={disabled}
       >
         가입자 추가
       </Button>
