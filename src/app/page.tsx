@@ -658,6 +658,59 @@ const feedByCategory = useMemo(() => {
     alert("가입자를 추가했습니다.");
   }
 
+    /** 관리자: 가입자 삭제 (+ 이벤트에서 깨끗이 제거) */
+  function adminDeleteUser(userId: number) {
+    if (!isAdmin) return;
+
+    const target = users.find(u => u.id === userId);
+    if (!target) return;
+
+    // 마지막 관리자 보호
+    const adminCount = users.filter(u => u.isAdmin).length;
+    if (target.isAdmin && adminCount <= 1) {
+      alert("마지막 관리자 계정은 삭제할 수 없습니다.");
+      return;
+    }
+
+    if (!confirm(`'${target.name}' 사용자를 삭제할까요?\n이 사용자가 포함된 모든 일정에서 함께 제거됩니다.`)) return;
+
+    // 1) users에서 제거 (즉시 저장)
+    setUsers(prev => {
+      const nextUsers = prev.filter(u => u.id !== userId);
+      kvSave("users", nextUsers).catch(()=>{});
+      return nextUsers;
+    });
+
+    // 2) events에서 참여자/취소요청 제거, 리더 공석이면 자동 승계, 정원 플래그 갱신 (즉시 저장)
+    setEvents(prev => {
+      const nextEvents = prev.map(e => {
+        let participants = e.participants.filter(p => p.id !== userId);
+        const cancelRequests = e.cancelRequests.filter(r => r.userId !== userId);
+
+        // 리더 없으면 첫 번째 참여자를 리더로 승격
+        if (participants.length > 0 && !participants.some(p => p.leader)) {
+          participants = participants.map((p, idx) => ({ ...p, leader: idx === 0 }));
+        }
+
+        return {
+          ...e,
+          participants,
+          cancelRequests,
+          openForApplications: participants.length < CAPACITY
+        };
+      });
+      kvSave("events", nextEvents).catch(()=>{});
+      return nextEvents;
+    });
+
+    // 3) 자기 자신을 지웠다면 로그아웃
+    if (currentUser?.id === userId) {
+      setCurrentUserId(null);
+      alert("현재 로그인한 계정을 삭제했으므로 로그아웃됩니다.");
+    }
+  }
+
+
   /** 로그인 게이트 */
   if (!currentUser) {
     return (
@@ -980,13 +1033,47 @@ const feedByCategory = useMemo(() => {
             <Card>
               <div style={{fontSize:14, fontWeight:600, marginBottom:8}}>가입자 관리</div>
               <AdminUserCreator onCreate={adminCreateUser} disabled={!usersReady} />
-              <div style={{marginTop:12, display:"grid", gridTemplateColumns:"1fr 1fr", gap:8}}>
-                {users.map(u=>(
-                  <div key={u.id} style={{border:"1px solid #e5e7eb", borderRadius:10, padding:8, display:"flex", justifyContent:"space-between", fontSize:14}}>
-                    <div>{u.name}{u.isAdmin?" (관리자)":""}</div>
-                    <div style={S.small}>id: {u.id}</div>
-                  </div>
-                ))}
+
+              <div style={{marginTop:12, display:"grid", gridTemplateColumns:"1fr", gap:8}}>
+                {users.map(u => {
+                  const lastAdmin = u.isAdmin && users.filter(x => x.isAdmin).length <= 1;
+                  const isSelf = currentUser?.id === u.id;
+                  const disableDelete = lastAdmin; // 마지막 관리자는 삭제 불가
+
+                  return (
+                    <div
+                      key={u.id}
+                      style={{
+                        border:"1px solid #e5e7eb",
+                        borderRadius:10,
+                        padding:8,
+                        display:"flex",
+                        alignItems:"center",
+                        gap:12
+                      }}
+                    >
+                      <div style={{flex:1}}>
+                        <div style={{fontSize:14}}>
+                          {u.name}{u.isAdmin ? " (관리자)" : ""}
+                        </div>
+                        <div style={S.small}>id: {u.id}</div>
+                      </div>
+
+                      <Button
+                        kind="red"
+                        onClick={() => adminDeleteUser(u.id)}
+                        disabled={disableDelete}
+                        title={
+                          disableDelete
+                            ? "마지막 관리자 계정은 삭제할 수 없습니다."
+                            : (isSelf ? "내 계정을 삭제하면 로그아웃됩니다." : "")
+                        }
+                      >
+                        삭제
+                      </Button>
+                    </div>
+                  );
+                })}
               </div>
             </Card>
 
